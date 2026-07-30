@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: write
-  workflows: write
 
 jobs:
   update:
@@ -94,10 +93,10 @@ jobs:
             curl -sL -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tarball/${TAG_NAME}" | tar -xz --strip-components=1
           fi
 
-          # 还原并保留本地的 .github/workflows 目录，防止上游工作流覆盖或触发推送权限报错
-          log "还原并保护本地 .github/workflows 目录..."
-          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
-          git clean -fd .github/workflows/ 2>/dev/null || true
+          # 彻底移除解压出来的上游 .github 文件夹，并精确还原你本地原有的 .github 目录
+          log "清理上游工作流文件，保护本地 .github 配置..."
+          rm -rf .github
+          git checkout HEAD -- .github
 
           # 写入最新版本号
           echo "$TAG_NAME" > version.txt
