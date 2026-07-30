@@ -1,496 +1,82 @@
-name: Auto Update and Deploy Worker
+name: Auto Update Worker
 
 on:
   push:
     branches:
       - main
-
   schedule:
-    # 每天 UTC 1:00，即北京时间 9:00
-    - cron: "0 1 * * *"
-
+    - cron: "0 1 * * *" # 每天凌晨1点自动检查更新
   workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新（忽略版本检查）'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
 
-concurrency:
-  group: auto-update-and-deploy-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  UPSTREAM_REPO: bia-pain-bache/BPB-Worker-Panel
-  CF_PROJECT_NAME: niuiniuniu
-  WRANGLER_VERSION: "4.115.0"
-
 jobs:
-  update-and-deploy:
-    name: Update and Deploy to Cloudflare Pages
+  update:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    defaults:
-      run:
-        shell: bash
-
     steps:
-      # ============================================================
-      # 1. 初始化仓库
-      # ============================================================
+      - name: 检出仓库
+        uses: actions/checkout@v4
 
-      - name: 初始化仓库
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      # ============================================================
-      # 2. 获取本地版本
-      # ============================================================
-
-      - name: 获取当前本地版本
+      - name: 设置环境变量
         run: |
-          set -euo pipefail
+          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_ENV
+          echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
-          echo "::group::获取本地版本"
-
-          if [[ -f "version.txt" ]]; then
-            LOCAL_VERSION="$(tr -d '[:space:]' < version.txt)"
-            echo "当前本地版本：${LOCAL_VERSION:-未知}"
-          else
-            LOCAL_VERSION=""
-            echo "首次同步，没有找到 version.txt"
-          fi
-
-          echo "LOCAL_VERSION=$LOCAL_VERSION" >> "$GITHUB_ENV"
-
-          echo "::endgroup::"
-
-      # ============================================================
-      # 3. 获取上游最新 Release
-      # ============================================================
-
-      - name: 获取上游最新 Release
+      - name: 检查并更新Worker代码
         env:
-          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          # 日志函数
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
 
-          echo "::group::获取上游最新 Release"
+          log "开始检查更新..."
 
-          API_URL="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
+          # 获取本地版本
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+          log "本地版本: ${LOCAL_VERSION:-无}"
 
-          RESPONSE="$(
-            curl \
-              --fail \
-              --silent \
-              --show-error \
-              --location \
-              --retry 3 \
-              --retry-delay 3 \
-              --connect-timeout 30 \
-              --max-time 120 \
-              --header "Accept: application/vnd.github+json" \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header "X-GitHub-Api-Version: 2022-11-28" \
-              "$API_URL"
-          )"
-
-          TAG_NAME="$(jq -r '.tag_name // empty' <<< "$RESPONSE")"
-
-          if [[ -z "$TAG_NAME" ]]; then
-            echo "::error::无法获取上游最新 Release 版本号"
+          # 获取最新Release信息
+          log "获取最新Release信息..."
+          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
+          if [ $? -ne 0 ]; then
+            log "ERROR: 无法访问GitHub API"
             exit 1
           fi
 
-          # 优先使用 worker.zip，其次使用 worker.js
-          ASSET_JSON="$(
-            jq -c '
-              (
-                [.assets[]? | select(.name == "worker.zip")] +
-                [.assets[]? | select(.name == "worker.js")]
-              )[0] // empty
-            ' <<< "$RESPONSE"
-          )"
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
 
-          if [[ -z "$ASSET_JSON" ]]; then
-            echo "::error::上游版本 $TAG_NAME 中没有 worker.zip 或 worker.js"
-            echo "当前 Release 包含以下文件："
-            jq -r '.assets[]?.name' <<< "$RESPONSE"
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            log "ERROR: 未找到 $TARGET_FILE"
             exit 1
           fi
+          log "最新版本: $TAG_NAME"
 
-          ASSET_NAME="$(jq -r '.name // empty' <<< "$ASSET_JSON")"
-          DOWNLOAD_URL="$(jq -r '.browser_download_url // empty' <<< "$ASSET_JSON")"
-
-          if [[ -z "$ASSET_NAME" || -z "$DOWNLOAD_URL" ]]; then
-            echo "::error::无法获取 Release 文件名称或下载地址"
-            exit 1
+          # 判断是否需要更新
+          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            log "已是最新版本，无需更新"
+            exit 0
           fi
 
-          echo "上游最新版本：$TAG_NAME"
-          echo "Release 文件：$ASSET_NAME"
-          echo "下载地址：$DOWNLOAD_URL"
+          # 下载并更新
+          log "下载 $TARGET_FILE..."
+          wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
+          log "解压 $TARGET_FILE..."
+          unzip -o "$TARGET_FILE"
+          rm "$TARGET_FILE"
+          echo "$TAG_NAME" > version.txt
+          log "更新完成，新版本: $TAG_NAME"
 
-          {
-            echo "TAG_NAME=$TAG_NAME"
-            echo "ASSET_NAME=$ASSET_NAME"
-            echo "DOWNLOAD_URL=$DOWNLOAD_URL"
-          } >> "$GITHUB_ENV"
-
-          echo "::endgroup::"
-
-      # ============================================================
-      # 4. 判断是否需要更新
-      # ============================================================
-
-      - name: 判断是否需要更新
-        run: |
-          set -euo pipefail
-
-          echo "::group::检查版本"
-
-          if [[ "$LOCAL_VERSION" == "$TAG_NAME" ]]; then
-            echo "当前已经是最新版本：$TAG_NAME"
-            echo "UPDATE_NEEDED=false" >> "$GITHUB_ENV"
-          else
-            echo "发现新版本：${LOCAL_VERSION:-无} → $TAG_NAME"
-            echo "UPDATE_NEEDED=true" >> "$GITHUB_ENV"
-          fi
-
-          echo "::endgroup::"
-
-      # ============================================================
-      # 5. 下载和处理新版本
-      # ============================================================
-
-      - name: 下载并处理新版本
-        if: env.UPDATE_NEEDED == 'true'
-        run: |
-          set -euo pipefail
-
-          TEMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$TEMP_DIR"' EXIT
-
-          DOWNLOAD_FILE="$TEMP_DIR/$ASSET_NAME"
-
-          echo "::group::下载 $ASSET_NAME"
-
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 3 \
-            --retry-delay 3 \
-            --connect-timeout 30 \
-            --max-time 300 \
-            --output "$DOWNLOAD_FILE" \
-            "$DOWNLOAD_URL"
-
-          if [[ ! -s "$DOWNLOAD_FILE" ]]; then
-            echo "::error::下载的文件不存在或内容为空"
-            exit 1
-          fi
-
-          echo "下载完成："
-          ls -lh "$DOWNLOAD_FILE"
-
-          echo "::endgroup::"
-
-          case "$ASSET_NAME" in
-            *.zip)
-              echo "::group::解压 $ASSET_NAME"
-
-              EXTRACT_DIR="$TEMP_DIR/extracted"
-              mkdir -p "$EXTRACT_DIR"
-
-              if ! unzip -q -o "$DOWNLOAD_FILE" -d "$EXTRACT_DIR"; then
-                echo "::error::无法解压 $ASSET_NAME"
-                exit 1
-              fi
-
-              # 优先查找 _worker.js
-              FOUND_WORKER="$(
-                find "$EXTRACT_DIR" \
-                  -type f \
-                  -name "_worker.js" \
-                  -print \
-                  -quit
-              )"
-
-              # 如果没有 _worker.js，则查找 worker.js
-              if [[ -z "$FOUND_WORKER" ]]; then
-                FOUND_WORKER="$(
-                  find "$EXTRACT_DIR" \
-                    -type f \
-                    -name "worker.js" \
-                    -print \
-                    -quit
-                )"
-              fi
-
-              if [[ -z "$FOUND_WORKER" ]]; then
-                echo "::error::压缩包中没有找到 _worker.js 或 worker.js"
-                echo "压缩包内容："
-                find "$EXTRACT_DIR" -maxdepth 5 -type f -print
-                exit 1
-              fi
-
-              cp "$FOUND_WORKER" "_worker.js"
-
-              echo "使用入口文件：$FOUND_WORKER"
-              echo "::endgroup::"
-              ;;
-
-            *.js)
-              cp "$DOWNLOAD_FILE" "_worker.js"
-              ;;
-
-            *)
-              echo "::error::不支持的 Release 文件类型：$ASSET_NAME"
-              exit 1
-              ;;
-          esac
-
-          printf '%s\n' "$TAG_NAME" > version.txt
-
-          echo "新版本处理完成："
-          ls -lh "_worker.js" "version.txt"
-
-      # ============================================================
-      # 6. 检查 Worker 文件
-      # ============================================================
-
-      - name: 检查 Worker 文件
-        run: |
-          set -euo pipefail
-
-          echo "::group::检查 Worker 文件"
-
-          if [[ ! -f "_worker.js" ]]; then
-            if [[ -f "worker.js" ]]; then
-              echo "找到 worker.js，重命名为 _worker.js"
-              mv "worker.js" "_worker.js"
-            else
-              echo "::error::仓库中没有 _worker.js 或 worker.js"
-              echo "当前仓库文件："
-              find . -maxdepth 3 -type f -print
-              exit 1
-            fi
-          fi
-
-          if [[ ! -s "_worker.js" ]]; then
-            echo "::error::_worker.js 不存在或内容为空"
-            exit 1
-          fi
-
-          FILE_SIZE="$(wc -c < "_worker.js")"
-
-          echo "_worker.js 文件大小：$FILE_SIZE 字节"
-
-          if (( FILE_SIZE < 1000 )); then
-            echo "::error::_worker.js 文件过小，可能下载不完整"
-            exit 1
-          fi
-
-          echo "Worker 文件检查通过"
-
-          echo "::endgroup::"
-
-      # ============================================================
-      # 7. 提交更新
-      # ============================================================
-
-      - name: 提交上游版本更新
-        if: env.UPDATE_NEEDED == 'true'
+      - name: 提交更改
+        if: success()
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 自动同步 BPB Worker ${{ env.TAG_NAME }} [skip ci]"
-          file_pattern: "_worker.js version.txt"
-          commit_user_name: "github-actions[bot]"
-          commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
-
-      # ============================================================
-      # 8. 准备部署目录
-      #
-      # 定时任务：只有发现新版本才部署
-      # 推送任务：始终部署
-      # 手动任务：始终部署
-      # ============================================================
-
-      - name: 准备 Cloudflare Pages 部署目录
-        if: github.event_name != 'schedule' || env.UPDATE_NEEDED == 'true'
-        run: |
-          set -euo pipefail
-
-          echo "::group::准备 Pages 部署目录"
-
-          rm -rf dist
-          mkdir -p dist
-
-          cp "_worker.js" "dist/_worker.js"
-
-          if [[ ! -s "dist/_worker.js" ]]; then
-            echo "::error::dist/_worker.js 不存在或内容为空"
-            exit 1
-          fi
-
-          FILE_SIZE="$(wc -c < "dist/_worker.js")"
-
-          echo "dist/_worker.js 文件大小：$FILE_SIZE 字节"
-
-          if (( FILE_SIZE < 1000 )); then
-            echo "::error::dist/_worker.js 文件过小"
-            exit 1
-          fi
-
-          echo "Pages 部署目录："
-          ls -lah dist
-
-          echo "::endgroup::"
-
-      # ============================================================
-      # 9. 检查 Cloudflare Secrets
-      # ============================================================
-
-      - name: 检查 Cloudflare Secrets
-        if: github.event_name != 'schedule' || env.UPDATE_NEEDED == 'true'
-        env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${CF_API_TOKEN:-}" ]]; then
-            echo "::error::GitHub Secret CLOUDFLARE_API_TOKEN 未设置"
-            exit 1
-          fi
-
-          if [[ -z "${CF_ACCOUNT_ID:-}" ]]; then
-            echo "::error::GitHub Secret CLOUDFLARE_ACCOUNT_ID 未设置"
-            exit 1
-          fi
-
-          echo "Cloudflare Secrets 已设置"
-          echo "Account ID 前 6 位：${CF_ACCOUNT_ID:0:6}******"
-
-      # ============================================================
-      # 10. 验证 Cloudflare Pages 项目
-      # ============================================================
-
-      - name: 验证 Cloudflare Pages 项目
-        if: github.event_name != 'schedule' || env.UPDATE_NEEDED == 'true'
-        env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-
-          echo "::group::验证 Cloudflare Pages 项目"
-
-          echo "正在检查项目：$CF_PROJECT_NAME"
-
-          API_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}"
-
-          RESPONSE="$(
-            curl \
-              --silent \
-              --show-error \
-              --location \
-              --connect-timeout 30 \
-              --max-time 120 \
-              --header "Authorization: Bearer $CF_API_TOKEN" \
-              --header "Content-Type: application/json" \
-              "$API_URL"
-          )"
-
-          SUCCESS="$(jq -r '.success // false' <<< "$RESPONSE")"
-
-          if [[ "$SUCCESS" != "true" ]]; then
-            echo "::error::无法访问 Cloudflare Pages 项目：$CF_PROJECT_NAME"
-
-            jq -r '
-              if ((.errors // []) | length) > 0 then
-                .errors[] |
-                "错误代码：\(.code)，错误信息：\(.message)"
-              else
-                "Cloudflare 未返回具体错误信息"
-              end
-            ' <<< "$RESPONSE"
-
-            echo ""
-            echo "请检查："
-            echo "1. niuiniuniu 是否为 Cloudflare Pages 项目"
-            echo "2. CLOUDFLARE_ACCOUNT_ID 是否为 Account ID"
-            echo "3. API Token 与 Account ID 是否属于同一账户"
-            echo "4. API Token 是否具有 Cloudflare Pages Edit 权限"
-
-            exit 1
-          fi
-
-          RETURNED_PROJECT="$(
-            jq -r '.result.name // empty' <<< "$RESPONSE"
-          )"
-
-          if [[ "$RETURNED_PROJECT" != "$CF_PROJECT_NAME" ]]; then
-            echo "::error::Cloudflare 返回的项目名称不正确"
-            echo "预期项目：$CF_PROJECT_NAME"
-            echo "返回项目：${RETURNED_PROJECT:-空}"
-            exit 1
-          fi
-
-          echo "项目验证成功：$CF_PROJECT_NAME"
-
-          echo "::endgroup::"
-
-      # ============================================================
-      # 11. 配置 Node.js 24
-      # ============================================================
-
-      - name: 配置 Node.js 24
-        if: github.event_name != 'schedule' || env.UPDATE_NEEDED == 'true'
-        uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-          check-latest: true
-
-      - name: 检查 Node.js 环境
-        if: github.event_name != 'schedule' || env.UPDATE_NEEDED == 'true'
-        run: |
-          set -euo pipefail
-
-          echo "Node.js 版本：$(node --version)"
-          echo "npm 版本：$(npm --version)"
-
-          NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-
-          if (( NODE_MAJOR < 22 )); then
-            echo "::error::Wrangler 4.115.0 要求 Node.js 22 或更高版本"
-            exit 1
-          fi
-
-      # ============================================================
-      # 12. 部署到 Cloudflare Pages
-      # ============================================================
-
-      - name: 部署到 Cloudflare Pages
-        if: github.event_name != 'schedule' || env.UPDATE_NEEDED == 'true'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-
-          echo "::group::部署到 Cloudflare Pages"
-
-          echo "目标项目：$CF_PROJECT_NAME"
-          echo "目标分支：main"
-
-          npx --yes "wrangler@$WRANGLER_VERSION" pages deploy dist \
-            --project-name="$CF_PROJECT_NAME" \
-            --branch="main" \
-            --commit-dirty=true
-
-          echo "Cloudflare Pages 部署完成"
-
-          echo "::endgroup::"
+          commit_message: "🔄 自动同步Worker版本: ${{ steps.check_update.outputs.tag_name || '未知' }}"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
