@@ -23,11 +23,13 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取完整 Git 历史，方便后续 rebase
+          fetch-depth: 0 # 获取完整 Git 历史，避免推送冲突
 
       - name: 设置环境变量
         run: |
-          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_ENV
+          # 如果要拉取 zzx-qtt 的版本，保持 zzx-qtt；如果要拉取 bia-pain-bache 原版，修改为 bia-pain-bache
+          echo "REPO_OWNER=zzx-qtt" >> $GITHUB_ENV
+          echo "REPO_NAME=BPB-Worker-Panel" >> $GITHUB_ENV
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
       - name: 检查并更新Worker代码
@@ -44,46 +46,57 @@ jobs:
           LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
           log "本地版本: ${LOCAL_VERSION:-无}"
 
-          # 获取Release信息
-          log "获取Release信息..."
+          # 获取最新 Release 信息
+          REPO_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
+          log "获取最新 Release 信息 (${REPO_OWNER}/${REPO_NAME})..."
           RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
           if [ $? -ne 0 ]; then
             log "ERROR: 无法访问GitHub API"
             exit 1
           fi
 
-          # 遍历所有Release，寻找包含目标文件的最新Release
-          RELEASE_INFO=$(echo "$RESPONSE" | jq -r --arg target "$TARGET_FILE" '
-            first(.[] | select(.assets[]? | .name == $target)) | 
-            {tag_name: .tag_name, download_url: (.assets[] | select(.name == $target) | .browser_download_url)}
-          ')
+          # 强制提取最新一个 Release (列表第0个)
+          LATEST_RELEASE=$(echo "$RESPONSE" | jq -r 'if type=="array" then .[0] else . end')
+          TAG_NAME=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // empty')
 
-          TAG_NAME=$(echo "$RELEASE_INFO" | jq -r '.tag_name // empty')
-          DOWNLOAD_URL=$(echo "$RELEASE_INFO" | jq -r '.download_url // empty')
-
-          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ] || [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            log "ERROR: 未在任何 Release 中找到包含 $TARGET_FILE 的版本"
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
+            log "ERROR: 未能获取到最新 Release 标签"
             exit 1
           fi
-          log "最新可用版本: $TAG_NAME"
 
+          log "最新Release版本: $TAG_NAME"
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
           # 判断是否需要更新
           FORCE_UPDATE="${{ github.event.inputs.force_update }}"
           if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
-            log "已是最新版本，无需更新"
+            log "已是最新版本 ($TAG_NAME)，无需更新"
             echo "need_update=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           echo "need_update=true" >> $GITHUB_OUTPUT
 
-          # 下载并更新
-          log "下载 $TARGET_FILE..."
-          wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
-          log "解压 $TARGET_FILE..."
-          unzip -o "$TARGET_FILE"
-          rm "$TARGET_FILE"
+          # 检查最新 Release 中是否存在 TARGET_FILE (worker.zip) 附件
+          DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | jq -r --arg target "$TARGET_FILE" '.assets[]? | select(.name == $target) | .browser_download_url // empty')
+
+          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
+            log "在最新 Release 中找到资产包 $TARGET_FILE，正在下载..."
+            wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
+            log "解压 $TARGET_FILE..."
+            unzip -o "$TARGET_FILE"
+            rm -f "$TARGET_FILE"
+          else
+            log "提示: 最新 Release ($TAG_NAME) 未包含 $TARGET_FILE 附件，正在下载最新源码包并全量更新..."
+            TARBALL_URL=$(echo "$LATEST_RELEASE" | jq -r '.tarball_url // empty')
+            if [ -n "$TARBALL_URL" ] && [ "$TARBALL_URL" != "null" ]; then
+              curl -sL -H "Authorization: token $GITHUB_TOKEN" "$TARBALL_URL" | tar -xz --strip-components=1
+            else
+              log "ERROR: 无法获取源码下载地址"
+              exit 1
+            fi
+          fi
+
+          # 写入最新版本号
           echo "$TAG_NAME" > version.txt
           log "更新完成，新版本: $TAG_NAME"
 
@@ -96,7 +109,6 @@ jobs:
           git add .
           if ! git diff --cached --quiet; then
             git commit -m "🔄 自动同步Worker版本: ${{ steps.check_update.outputs.tag_name }}"
-            # 先 rebase 远程最新提交，避免推送冲突
             git pull --rebase origin main
             git push origin main
           else
