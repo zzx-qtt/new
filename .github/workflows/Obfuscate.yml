@@ -105,7 +105,7 @@ jobs:
             npm run build || node scripts/build.js || true
           fi
 
-          # 核心优化：确保 Cloudflare 部署所需的 _worker.js 文件始终与最新的构建产物同步
+          # 确保 Cloudflare 部署所需的 _worker.js 文件始终同步
           log "正在处理部署入口文件 (worker.js -> _worker.js)..."
           if [ -f "dist/_worker.js" ]; then
             cp -f dist/_worker.js ./_worker.js
@@ -128,7 +128,7 @@ jobs:
 
           # 写入最新版本号
           echo "$TAG_NAME" > version.txt
-          log "更新与入口文件补丁处理完成，新版本: $TAG_NAME"
+          log "更新与入口文件处理完成，新版本: $TAG_NAME"
 
       - name: 提交并推送更改
         if: success() && steps.check_update.outputs.need_update == 'true'
@@ -136,7 +136,10 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
+          # 核心修复：添加 -f 选项强制突破 .gitignore 拦截
+          git add -f _worker.js worker.js version.txt
           git add .
+          
           if ! git diff --cached --quiet; then
             git commit -m "🔄 自动同步并构建Worker版本: ${{ steps.check_update.outputs.tag_name }}"
             git pull --rebase origin main
