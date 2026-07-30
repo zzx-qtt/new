@@ -85,28 +85,19 @@ jobs:
           fi
           echo "need_update=true" >> $GITHUB_OUTPUT
 
-          # 检查 Release 中是否有预编译包
-          DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | jq -r --arg target "$TARGET_FILE" '.assets[]? | select(.name == $target) | .browser_download_url // empty')
+          # 下载最新源码
+          log "正在下载 $TAG_NAME 最新源码包..."
+          curl -sL -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tarball/${TAG_NAME}" | tar -xz --strip-components=1
 
-          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
-            log "找到 $TARGET_FILE 预编译包，正在下载并解压..."
-            wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
-            unzip -o "$TARGET_FILE"
-            rm -f "$TARGET_FILE"
-          else
-            log "最新版本 ($TAG_NAME) 未包含预编译包，正在下载源码..."
-            curl -sL -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tarball/${TAG_NAME}" | tar -xz --strip-components=1
-          fi
-
-          # 安装依赖并编译打包
+          # 执行 Node 依赖安装与打包构建
           if [ -f "package.json" ]; then
-            log "检测到 Node/TypeScript 项目，开始安装依赖并打包..."
+            log "开始安装依赖并编译生成打包文件..."
             npm install
-            npm run build || node scripts/build.js || true
+            npm run build
           fi
 
-          # 确保 Cloudflare 部署所需的 _worker.js 文件始终同步
-          log "正在处理部署入口文件 (worker.js -> _worker.js)..."
+          # 确保 Cloudflare Pages / Workers 运行入口 _worker.js 存在
+          log "处理 Cloudflare 部署入口文件..."
           if [ -f "dist/_worker.js" ]; then
             cp -f dist/_worker.js ./_worker.js
             cp -f dist/_worker.js ./worker.js
@@ -115,20 +106,24 @@ jobs:
             cp -f dist/worker.js ./worker.js
           elif [ -f "worker.js" ]; then
             cp -f worker.js ./_worker.js
-          elif [ -f "_worker.js" ]; then
-            cp -f _worker.js ./worker.js
-          else
-            log "WARNING: 未在根目录或 dist 目录下找到可用的 js 产物文件！"
           fi
 
+          if [ ! -f "_worker.js" ]; then
+            log "ERROR: 构建失败，未能生成 _worker.js"
+            exit 1
+          fi
+
+          # 清理 npm 依赖目录，防止 node_modules 被误提交
+          rm -rf node_modules
+
           # 清理上游工作流文件，保护本地 .github 配置
-          log "清理上游工作流文件，保护本地 .github 配置..."
+          log "保护本地 .github 配置..."
           rm -rf .github
           git checkout HEAD -- .github
 
           # 写入最新版本号
           echo "$TAG_NAME" > version.txt
-          log "更新与入口文件处理完成，新版本: $TAG_NAME"
+          log "更新与打包成功完成，新版本: $TAG_NAME"
 
       - name: 提交并推送更改
         if: success() && steps.check_update.outputs.need_update == 'true'
@@ -136,7 +131,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # 核心修复：添加 -f 选项强制突破 .gitignore 拦截
+          # 强制将打包产物加入 Git 暂存区
           git add -f _worker.js worker.js version.txt
           git add .
           
