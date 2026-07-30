@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       force_update:
-        description: '是否强制更新（忽略版本检查）'
+        description: '是否强制更新/重新编译（忽略版本检查）'
         required: false
-        default: 'false'
+        default: 'true'
 
 permissions:
   contents: write
@@ -44,15 +44,14 @@ jobs:
           # 日志函数
           log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
 
-          log "开始检查更新..."
+          log "开始检查更新与构建程序..."
 
           # 获取本地版本
           LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
-          log "本地版本: ${LOCAL_VERSION:-无}"
+          log "本地记录版本: ${LOCAL_VERSION:-无}"
 
           # 获取上游仓库最新 Release 信息
           REPO_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
-          log "获取最新 Release 信息 (${REPO_OWNER}/${REPO_NAME})..."
           RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
           if [ $? -ne 0 ]; then
             log "ERROR: 无法访问GitHub API"
@@ -76,10 +75,11 @@ jobs:
           log "最新上游版本: $TAG_NAME"
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
-          # 判断是否需要更新
           FORCE_UPDATE="${{ github.event.inputs.force_update }}"
-          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
-            log "已是最新版本 ($TAG_NAME)，无需更新"
+
+          # 修复死锁：仅当版本一致、_worker.js 存在、且非强制更新/非手动触发时才跳过
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ -f "_worker.js" ] && [ "$FORCE_UPDATE" != "true" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            log "已是最新版本 ($TAG_NAME) 且构建产物完整，无需更新"
             echo "need_update=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -91,7 +91,7 @@ jobs:
 
           # 执行 Node 依赖安装与打包构建
           if [ -f "package.json" ]; then
-            log "开始安装依赖并编译生成打包文件..."
+            log "开始安装依赖并编译打包 (npm run build)..."
             npm install
             npm run build
           fi
@@ -123,7 +123,7 @@ jobs:
 
           # 写入最新版本号
           echo "$TAG_NAME" > version.txt
-          log "更新与打包成功完成，新版本: $TAG_NAME"
+          log "代码打包成功，_worker.js 已准备完毕！"
 
       - name: 提交并推送更改
         if: success() && steps.check_update.outputs.need_update == 'true'
@@ -140,5 +140,5 @@ jobs:
             git pull --rebase origin main
             git push origin main
           else
-            echo "没有检测到文件更新，跳过提交"
+            echo "没有检测到文件变更，跳过提交"
           fi
