@@ -27,8 +27,8 @@ jobs:
 
       - name: 设置环境变量
         run: |
-          # 如果要拉取 zzx-qtt 的版本，保持 zzx-qtt；如果要拉取 bia-pain-bache 原版，修改为 bia-pain-bache
-          echo "REPO_OWNER=zzx-qtt" >> $GITHUB_ENV
+          # 必须使用发布Release的原作者仓库地址
+          echo "REPO_OWNER=bia-pain-bache" >> $GITHUB_ENV
           echo "REPO_NAME=BPB-Worker-Panel" >> $GITHUB_ENV
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
@@ -46,7 +46,7 @@ jobs:
           LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
           log "本地版本: ${LOCAL_VERSION:-无}"
 
-          # 获取最新 Release 信息
+          # 获取上游仓库最新 Release 信息
           REPO_URL="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases"
           log "获取最新 Release 信息 (${REPO_OWNER}/${REPO_NAME})..."
           RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
@@ -55,16 +55,23 @@ jobs:
             exit 1
           fi
 
-          # 强制提取最新一个 Release (列表第0个)
-          LATEST_RELEASE=$(echo "$RESPONSE" | jq -r 'if type=="array" then .[0] else . end')
+          # 获取列表中的第一个（即最新发布的）Release
+          LATEST_RELEASE=$(echo "$RESPONSE" | jq -r 'if type=="array" and length > 0 then .[0] else empty end')
           TAG_NAME=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // empty')
 
+          # 备用逻辑：如果 /releases 为空，尝试直接获取最新的 git tag
           if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
-            log "ERROR: 未能获取到最新 Release 标签"
+            log "未在 Releases 中找到记录，尝试检索 Tags..."
+            TAGS_RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tags")
+            TAG_NAME=$(echo "$TAGS_RESPONSE" | jq -r '.[0].name // empty')
+          fi
+
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
+            log "ERROR: 未能获取到最新 Release 或 Tag 标签"
             exit 1
           fi
 
-          log "最新Release版本: $TAG_NAME"
+          log "最新上游版本: $TAG_NAME"
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
           # 判断是否需要更新
@@ -76,24 +83,17 @@ jobs:
           fi
           echo "need_update=true" >> $GITHUB_OUTPUT
 
-          # 检查最新 Release 中是否存在 TARGET_FILE (worker.zip) 附件
+          # 检查 Release 中是否有 worker.zip 附件
           DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | jq -r --arg target "$TARGET_FILE" '.assets[]? | select(.name == $target) | .browser_download_url // empty')
 
           if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
-            log "在最新 Release 中找到资产包 $TARGET_FILE，正在下载..."
+            log "找到 $TARGET_FILE 附件，正在下载并解压..."
             wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
-            log "解压 $TARGET_FILE..."
             unzip -o "$TARGET_FILE"
             rm -f "$TARGET_FILE"
           else
-            log "提示: 最新 Release ($TAG_NAME) 未包含 $TARGET_FILE 附件，正在下载最新源码包并全量更新..."
-            TARBALL_URL=$(echo "$LATEST_RELEASE" | jq -r '.tarball_url // empty')
-            if [ -n "$TARBALL_URL" ] && [ "$TARBALL_URL" != "null" ]; then
-              curl -sL -H "Authorization: token $GITHUB_TOKEN" "$TARBALL_URL" | tar -xz --strip-components=1
-            else
-              log "ERROR: 无法获取源码下载地址"
-              exit 1
-            fi
+            log "最新版本 ($TAG_NAME) 未包含 $TARGET_FILE 附件，切换为直接下载最新源码包全量覆盖..."
+            curl -sL -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tarball/${TAG_NAME}" | tar -xz --strip-components=1
           fi
 
           # 写入最新版本号
