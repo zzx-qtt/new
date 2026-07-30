@@ -113,6 +113,13 @@ jobs:
             exit 1
           fi
 
+          # 核心修复：生成 Wrangler 配置文件，强制 Cloudflare 开启 nodejs 兼容性
+          log "生成 Cloudflare 配置文件以开启 nodejs_compat..."
+          cat << EOF > wrangler.toml
+          compatibility_flags = ["nodejs_compat"]
+          compatibility_date = "2024-07-30"
+          EOF
+
           # 清理 npm 依赖目录，防止 node_modules 被误提交
           rm -rf node_modules
 
@@ -123,7 +130,7 @@ jobs:
 
           # 写入最新版本号
           echo "$TAG_NAME" > version.txt
-          log "代码打包成功，_worker.js 已准备完毕！"
+          log "代码打包成功，_worker.js 和配置已准备完毕！"
 
       - name: 提交并推送更改
         if: success() && steps.check_update.outputs.need_update == 'true'
@@ -131,8 +138,8 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # 强制将打包产物加入 Git 暂存区
-          git add -f _worker.js worker.js version.txt
+          # 强制将打包产物和 Cloudflare 配置文件加入 Git 暂存区
+          git add -f _worker.js worker.js version.txt wrangler.toml
           git add .
           
           if ! git diff --cached --quiet; then
