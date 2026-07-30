@@ -85,7 +85,7 @@ jobs:
           fi
           echo "need_update=true" >> $GITHUB_OUTPUT
 
-          # 检查 Release 中是否有预编译的 worker.zip 附件
+          # 检查 Release 中是否有预编译包
           DOWNLOAD_URL=$(echo "$LATEST_RELEASE" | jq -r --arg target "$TARGET_FILE" '.assets[]? | select(.name == $target) | .browser_download_url // empty')
 
           if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
@@ -98,11 +98,27 @@ jobs:
             curl -sL -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tarball/${TAG_NAME}" | tar -xz --strip-components=1
           fi
 
-          # 核心修复：如果存在 package.json，自动安装依赖并编译生成全新的 _worker.js
+          # 安装依赖并编译打包
           if [ -f "package.json" ]; then
-            log "检测到 Node/TypeScript 项目，开始安装依赖并执行打包构建..."
+            log "检测到 Node/TypeScript 项目，开始安装依赖并打包..."
             npm install
             npm run build || node scripts/build.js || true
+          fi
+
+          # 核心优化：确保 Cloudflare 部署所需的 _worker.js 文件始终与最新的构建产物同步
+          log "正在处理部署入口文件 (worker.js -> _worker.js)..."
+          if [ -f "dist/_worker.js" ]; then
+            cp -f dist/_worker.js ./_worker.js
+            cp -f dist/_worker.js ./worker.js
+          elif [ -f "dist/worker.js" ]; then
+            cp -f dist/worker.js ./_worker.js
+            cp -f dist/worker.js ./worker.js
+          elif [ -f "worker.js" ]; then
+            cp -f worker.js ./_worker.js
+          elif [ -f "_worker.js" ]; then
+            cp -f _worker.js ./worker.js
+          else
+            log "WARNING: 未在根目录或 dist 目录下找到可用的 js 产物文件！"
           fi
 
           # 清理上游工作流文件，保护本地 .github 配置
@@ -112,7 +128,7 @@ jobs:
 
           # 写入最新版本号
           echo "$TAG_NAME" > version.txt
-          log "更新并构建完成，新版本: $TAG_NAME"
+          log "更新与入口文件补丁处理完成，新版本: $TAG_NAME"
 
       - name: 提交并推送更改
         if: success() && steps.check_update.outputs.need_update == 'true'
