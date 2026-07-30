@@ -29,6 +29,7 @@ jobs:
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
       - name: 检查并更新Worker代码
+        id: check_update
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -41,29 +42,41 @@ jobs:
           LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
           log "本地版本: ${LOCAL_VERSION:-无}"
 
-          # 获取最新Release信息
-          log "获取最新Release信息..."
+          # 获取Release信息
+          log "获取Release信息..."
           RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
           if [ $? -ne 0 ]; then
             log "ERROR: 无法访问GitHub API"
             exit 1
           fi
 
-          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
-          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
+          # 优化：遍历所有Release，寻找包含目标文件的最新Release
+          RELEASE_INFO=$(echo "$RESPONSE" | jq -r --arg target "$TARGET_FILE" '
+            first(.[] | select(.assets[]? | .name == $target)) | 
+            {tag_name: .tag_name, download_url: (.assets[] | select(.name == $target) | .browser_download_url)}
+          ')
 
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
-            log "ERROR: 未找到 $TARGET_FILE"
+          TAG_NAME=$(echo "$RELEASE_INFO" | jq -r '.tag_name // empty')
+          DOWNLOAD_URL=$(echo "$RELEASE_INFO" | jq -r '.download_url // empty')
+
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ] || [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            log "ERROR: 未在任何 Release 中找到包含 $TARGET_FILE 的版本"
             exit 1
           fi
-          log "最新版本: $TAG_NAME"
+          log "最新可用版本: $TAG_NAME"
+
+          # 将 TAG_NAME 传递给后续步骤
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
           # 判断是否需要更新
-          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          FORCE_UPDATE="${{ github.event.inputs.force_update }}"
           if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
             log "已是最新版本，无需更新"
+            # 即使无需更新也输出标记，或者直接退出
+            echo "need_update=false" >> $GITHUB_OUTPUT
             exit 0
           fi
+          echo "need_update=true" >> $GITHUB_OUTPUT
 
           # 下载并更新
           log "下载 $TARGET_FILE..."
@@ -75,8 +88,8 @@ jobs:
           log "更新完成，新版本: $TAG_NAME"
 
       - name: 提交更改
-        if: success()
+        if: success() && steps.check_update.outputs.need_update == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 自动同步Worker版本: ${{ steps.check_update.outputs.tag_name || '未知' }}"
+          commit_message: "🔄 自动同步Worker版本: ${{ steps.check_update.outputs.tag_name }}"
           commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
