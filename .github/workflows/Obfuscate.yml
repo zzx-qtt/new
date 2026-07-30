@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 获取完整 Git 历史，方便后续 rebase
 
       - name: 设置环境变量
         run: |
@@ -50,7 +52,7 @@ jobs:
             exit 1
           fi
 
-          # 优化：遍历所有Release，寻找包含目标文件的最新Release
+          # 遍历所有Release，寻找包含目标文件的最新Release
           RELEASE_INFO=$(echo "$RESPONSE" | jq -r --arg target "$TARGET_FILE" '
             first(.[] | select(.assets[]? | .name == $target)) | 
             {tag_name: .tag_name, download_url: (.assets[] | select(.name == $target) | .browser_download_url)}
@@ -65,14 +67,12 @@ jobs:
           fi
           log "最新可用版本: $TAG_NAME"
 
-          # 将 TAG_NAME 传递给后续步骤
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
           # 判断是否需要更新
           FORCE_UPDATE="${{ github.event.inputs.force_update }}"
           if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
             log "已是最新版本，无需更新"
-            # 即使无需更新也输出标记，或者直接退出
             echo "need_update=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -87,9 +87,18 @@ jobs:
           echo "$TAG_NAME" > version.txt
           log "更新完成，新版本: $TAG_NAME"
 
-      - name: 提交更改
+      - name: 提交并推送更改
         if: success() && steps.check_update.outputs.need_update == 'true'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "🔄 自动同步Worker版本: ${{ steps.check_update.outputs.tag_name }}"
-          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          git add .
+          if ! git diff --cached --quiet; then
+            git commit -m "🔄 自动同步Worker版本: ${{ steps.check_update.outputs.tag_name }}"
+            # 先 rebase 远程最新提交，避免推送冲突
+            git pull --rebase origin main
+            git push origin main
+          else
+            echo "没有检测到文件更新，跳过提交"
+          fi
