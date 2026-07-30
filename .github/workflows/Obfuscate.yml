@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 jobs:
   update:
@@ -23,11 +24,10 @@ jobs:
       - name: 检出仓库
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 获取完整 Git 历史，避免推送冲突
+          fetch-depth: 0 # 获取完整 Git 历史
 
       - name: 设置环境变量
         run: |
-          # 必须使用发布Release的原作者仓库地址
           echo "REPO_OWNER=bia-pain-bache" >> $GITHUB_ENV
           echo "REPO_NAME=BPB-Worker-Panel" >> $GITHUB_ENV
           echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
@@ -55,11 +55,9 @@ jobs:
             exit 1
           fi
 
-          # 获取列表中的第一个（即最新发布的）Release
           LATEST_RELEASE=$(echo "$RESPONSE" | jq -r 'if type=="array" and length > 0 then .[0] else empty end')
           TAG_NAME=$(echo "$LATEST_RELEASE" | jq -r '.tag_name // empty')
 
-          # 备用逻辑：如果 /releases 为空，尝试直接获取最新的 git tag
           if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" == "null" ]; then
             log "未在 Releases 中找到记录，尝试检索 Tags..."
             TAGS_RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tags")
@@ -95,6 +93,11 @@ jobs:
             log "最新版本 ($TAG_NAME) 未包含 $TARGET_FILE 附件，切换为直接下载最新源码包全量覆盖..."
             curl -sL -H "Authorization: token $GITHUB_TOKEN" "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/tarball/${TAG_NAME}" | tar -xz --strip-components=1
           fi
+
+          # 还原并保留本地的 .github/workflows 目录，防止上游工作流覆盖或触发推送权限报错
+          log "还原并保护本地 .github/workflows 目录..."
+          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+          git clean -fd .github/workflows/ 2>/dev/null || true
 
           # 写入最新版本号
           echo "$TAG_NAME" > version.txt
