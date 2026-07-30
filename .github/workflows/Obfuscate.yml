@@ -9,7 +9,6 @@ on:
     # 每天 UTC 1:00，即北京时间 9:00
     - cron: "0 1 * * *"
 
-  # 允许在 GitHub Actions 页面手动运行
   workflow_dispatch:
 
 permissions:
@@ -30,14 +29,16 @@ jobs:
 
       - name: 获取当前本地版本
         run: |
+          set -euo pipefail
+
           echo -e "\033[34m[获取本地版本]\033[0m"
 
           if [ -f version.txt ]; then
             LOCAL_VERSION=$(tr -d '[:space:]' < version.txt)
             echo "当前本地版本：$LOCAL_VERSION"
           else
-            echo "首次同步，没有本地版本"
             LOCAL_VERSION=""
+            echo "首次同步，没有本地版本"
           fi
 
           echo "LOCAL_VERSION=$LOCAL_VERSION" >> "$GITHUB_ENV"
@@ -61,12 +62,10 @@ jobs:
           TAG_NAME=$(echo "$RESPONSE" | jq -r '.tag_name // empty')
 
           if [ -z "$TAG_NAME" ]; then
-            echo "错误：无法获得上游版本号"
-            echo "$RESPONSE"
+            echo "错误：无法获取上游版本号"
             exit 1
           fi
 
-          # 优先下载 worker.zip，如果不存在则下载 worker.js
           ASSET=$(echo "$RESPONSE" | jq -r '
             (
               [.assets[] | select(.name == "worker.zip")] +
@@ -78,8 +77,8 @@ jobs:
 
           if [ -z "$ASSET" ]; then
             echo "错误：上游版本 $TAG_NAME 中没有 worker.zip 或 worker.js"
-            echo "当前 Release 中的文件："
-            echo "$RESPONSE" | jq -r '.assets[].name'
+            echo "当前 Release 包含以下文件："
+            echo "$RESPONSE" | jq -r '.assets[]?.name'
             exit 1
           fi
 
@@ -97,6 +96,8 @@ jobs:
 
       - name: 判断是否需要更新
         run: |
+          set -euo pipefail
+
           echo -e "\033[34m[判断是否需要更新]\033[0m"
 
           if [ "$LOCAL_VERSION" = "$TAG_NAME" ]; then
@@ -114,7 +115,6 @@ jobs:
 
           echo -e "\033[34m[清理旧文件]\033[0m"
 
-          # 保留 GitHub Action、版本文件及说明文件
           find . -mindepth 1 -maxdepth 1 \
             ! -name '.git' \
             ! -name '.github' \
@@ -139,9 +139,8 @@ jobs:
               ;;
 
             *.js)
-              echo -e "\033[34m[处理单文件 Worker]\033[0m"
+              echo -e "\033[34m[处理 Worker JavaScript 文件]\033[0m"
 
-              # Cloudflare Pages 高级模式要求入口文件名为 _worker.js
               if [ "$ASSET_NAME" != "_worker.js" ]; then
                 mv "$ASSET_NAME" "_worker.js"
               fi
@@ -153,22 +152,33 @@ jobs:
               ;;
           esac
 
-          # 如果解压后得到 worker.js，则改名为 _worker.js
+          # 如果压缩包中使用 worker.js，改名为 Pages 所需的 _worker.js
           if [ -f "worker.js" ] && [ ! -f "_worker.js" ]; then
             mv "worker.js" "_worker.js"
+          fi
+
+          # 尝试查找解压到子目录中的入口文件
+          if [ ! -f "_worker.js" ]; then
+            FOUND_WORKER=$(find . -mindepth 2 -type f \
+              \( -name "_worker.js" -o -name "worker.js" \) \
+              | head -n 1 || true)
+
+            if [ -n "$FOUND_WORKER" ]; then
+              cp "$FOUND_WORKER" "_worker.js"
+            fi
           fi
 
           if [ ! -f "_worker.js" ]; then
             echo "错误：更新后没有找到 _worker.js"
             echo "当前目录内容："
-            find . -maxdepth 2 -type f -print
+            find . -maxdepth 3 -type f -print
             exit 1
           fi
 
           echo "$TAG_NAME" > version.txt
 
           echo "更新后的文件："
-          ls -al
+          ls -lah
 
       - name: 检查 Worker 文件
         run: |
@@ -181,8 +191,7 @@ jobs:
             mv "worker.js" "_worker.js"
           else
             echo "错误：仓库中没有 _worker.js 或 worker.js"
-            echo "当前文件："
-            find . -maxdepth 2 -type f -print
+            find . -maxdepth 3 -type f -print
             exit 1
           fi
 
@@ -191,7 +200,7 @@ jobs:
           echo "_worker.js 文件大小：$FILE_SIZE 字节"
 
           if [ "$FILE_SIZE" -lt 1000 ]; then
-            echo "错误：_worker.js 文件过小，可能下载失败"
+            echo "错误：_worker.js 文件过小，可能下载不完整"
             exit 1
           fi
 
@@ -203,7 +212,6 @@ jobs:
           file_pattern: "_worker.js version.txt"
           commit_user_name: "github-actions[bot]"
           commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
-          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
 
       - name: 准备 Cloudflare Pages 部署目录
         run: |
@@ -212,21 +220,134 @@ jobs:
           rm -rf dist
           mkdir -p dist
 
-          # Pages 高级模式入口
           cp "_worker.js" "dist/_worker.js"
-
-          echo "Cloudflare Pages 部署目录："
-          ls -lh dist
 
           if [ ! -s "dist/_worker.js" ]; then
             echo "错误：dist/_worker.js 不存在或内容为空"
             exit 1
           fi
 
-      - name: 部署到 Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
+          FILE_SIZE=$(wc -c < "dist/_worker.js")
+
+          echo "dist/_worker.js 文件大小：$FILE_SIZE 字节"
+
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "错误：dist/_worker.js 文件过小"
+            exit 1
+          fi
+
+          echo "Pages 部署目录："
+          ls -lah dist
+
+      - name: 检查 Cloudflare Secrets
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$CF_API_TOKEN" ]; then
+            echo "错误：GitHub Secret CLOUDFLARE_API_TOKEN 未设置"
+            exit 1
+          fi
+
+          if [ -z "$CF_ACCOUNT_ID" ]; then
+            echo "错误：GitHub Secret CLOUDFLARE_ACCOUNT_ID 未设置"
+            exit 1
+          fi
+
+          echo "Cloudflare Secrets 已设置"
+          echo "Account ID 前6位：${CF_ACCOUNT_ID:0:6}******"
+
+      - name: 验证 Cloudflare Pages 项目
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CF_PROJECT_NAME: new
+        run: |
+          set -euo pipefail
+
+          echo "正在检查 Cloudflare Pages 项目：$CF_PROJECT_NAME"
+
+          RESPONSE=$(curl -sS \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/pages/projects")
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+
+          if [ "$SUCCESS" != "true" ]; then
+            echo "错误：无法读取 Cloudflare Pages 项目"
+            echo "Cloudflare 返回："
+
+            echo "$RESPONSE" | jq -r '
+              if (.errors | length) > 0 then
+                .errors[] | "错误代码：\(.code)，错误信息：\(.message)"
+              else
+                "未知 Cloudflare API 错误"
+              end
+            '
+
+            echo ""
+            echo "请检查："
+            echo "1. CLOUDFLARE_ACCOUNT_ID 是否为 Account ID，而不是 Zone ID"
+            echo "2. API Token 与 Account ID 是否属于同一账户"
+            echo "3. API Token 是否具有 Cloudflare Pages Edit 权限"
+            exit 1
+          fi
+
+          AVAILABLE_PROJECTS=$(echo "$RESPONSE" | jq -r '.result[]?.name')
+
+          echo "当前账户中的 Pages 项目："
+
+          if [ -z "$AVAILABLE_PROJECTS" ]; then
+            echo "（没有找到任何 Pages 项目）"
+          else
+            echo "$AVAILABLE_PROJECTS"
+          fi
+
+          if ! echo "$AVAILABLE_PROJECTS" | grep -Fxq "$CF_PROJECT_NAME"; then
+            echo ""
+            echo "错误：当前账户中没有找到 Pages 项目：$CF_PROJECT_NAME"
+            echo ""
+            echo "请确认："
+            echo "1. new 是 Pages 项目，不是普通 Worker"
+            echo "2. CLOUDFLARE_ACCOUNT_ID 属于 new 所在账户"
+            echo "3. CLOUDFLARE_API_TOKEN 由同一个账户创建"
+            exit 1
+          fi
+
+          echo "验证成功：已找到 Pages 项目 $CF_PROJECT_NAME"
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v4
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name=new --branch=main
-          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          node-version: "20"
+
+      - name: 安装 Wrangler
+        run: |
+          set -euo pipefail
+
+          npm install \
+            --no-save \
+            --no-package-lock \
+            wrangler@4.115.0
+
+          echo "Wrangler 版本："
+          ./node_modules/.bin/wrangler --version
+
+      - name: 部署到 Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+
+          echo "开始部署到 Cloudflare Pages 项目：new"
+
+          ./node_modules/.bin/wrangler pages deploy dist \
+            --project-name="new" \
+            --branch="main" \
+            --commit-dirty=true
+
+          echo "Cloudflare Pages 部署完成"
